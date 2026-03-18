@@ -1,118 +1,166 @@
-# src/data_ingestion/crawler.py
-
-import requests
-import logging
 import os
-from tqdm import tqdm
+import subprocess
+import urllib.request
+import tarfile
+import logging
+import glob
+import shutil
 import asyncio
-import re
-
-# Correct import based on the library's structure
-from crawl4ai.async_webcrawler import AsyncWebCrawler
-from crawl4ai.async_configs import CrawlerRunConfig
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class IETFCrawler:
-    """
-    A class to crawl RFC documents from the IETF Datatracker.
-    
-    This class performs two main functions:
-    1. Queries the IETF Datatracker API to find URLs of relevant RFCs.
-    2. Uses Crawl4AI's AsyncWebCrawler to scrape the content and save it
-       as clean markdown files.
-    """
-    API_BASE_URL = "https://datatracker.ietf.org/api/v1/doc/document/"
-    DOC_BASE_URL = "https://datatracker.ietf.org/doc/html/"
-    
-    def __init__(self, output_dir: str = "data/markdown_docs"):
-        self.output_dir = output_dir
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
-            logging.info(f"Created output directory: {self.output_dir}")
+class DownloadProgressBar(tqdm):
+    def update_to(self, b=1, bsize=1, tsize=None):
+        if tsize is not None:
+            self.total = tsize
+        self.update(b * bsize - self.n)
 
-    def fetch_rfc_urls(self, keywords: list[str], limit_per_keyword: int = 20) -> list[str]:
-        """Fetches RFC URLs from the IETF Datatracker API."""
-        unique_urls = set()
-        logging.info(f"Fetching RFC URLs for keywords: {keywords}")
-        
-        for keyword in tqdm(keywords, desc="Fetching URLs"):
-            params = {"name__icontains": keyword, "type_id": "rfc", "limit": limit_per_keyword}
+class IETFBulkDownloader:
+    TARBALLS = {
+        "xml_all": "https://www.rfc-editor.org/in-notes/tar/xmlsource-all.tar.gz",
+        "xml_latest": "https://www.rfc-editor.org/in-notes/tar/xmlsource-rfc8650-latest.tar.gz",
+        "txt_all": "https://www.rfc-editor.org/in-notes/tar/RFC-all.tar.gz",
+        "txt_latest": "https://www.rfc-editor.org/in-notes/tar/RFCs8501-latest.tar.gz"
+    }
+
+    def __init__(self, base_dir="data"):
+        self.base_dir = base_dir
+        self.tar_dir = os.path.join(base_dir, "tarballs")
+        self.raw_dir = os.path.join(base_dir, "raw_rfcs") # Shared with rsync
+        self.output_dir = os.path.join(base_dir, "rfc_markdown") 
+
+        for d in [self.tar_dir, self.raw_dir, self.output_dir]:
+            os.makedirs(d, exist_ok=True)
+
+    def download_tarballs(self):
+        import ssl
+        # Create an unverified SSL context to bypass corporate proxy/firewall certificate errors
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        urllib.request.install_opener(opener)
+
+        for name, url in self.TARBALLS.items():
+            filepath = os.path.join(self.tar_dir, url.split("/")[-1])
+            if not os.path.exists(filepath):
+                logging.info(f"Downloading {url} to {filepath}")
+                with DownloadProgressBar(unit='B', unit_scale=True, miniters=1, desc=name) as t:
+                    urllib.request.urlretrieve(url, filename=filepath, reporthook=t.update_to)
+            else:
+                logging.info(f"Tarball {filepath} already exists. Skipping download.")
+
+    def extract_tarballs(self):
+        for name, url in self.TARBALLS.items():
+            filepath = os.path.join(self.tar_dir, url.split("/")[-1])
+            extract_path = self.raw_dir
+            
+            logging.info(f"Extracting {filepath} to {extract_path}")
             try:
-                response = requests.get(self.API_BASE_URL, params=params, timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                for doc in data.get("objects", []):
-                    rfc_name = doc.get("name")
-                    if rfc_name:
-                        unique_urls.add(f"{self.DOC_BASE_URL}{rfc_name}")
-            except requests.RequestException as e:
-                logging.error(f"API request failed for keyword '{keyword}': {e}")
-                
-        logging.info(f"Found {len(unique_urls)} unique RFC URLs.")
-        return list(unique_urls)
+                with tarfile.open(filepath, "r:gz") as tar:
+                    tar.extractall(path=extract_path)
+            except Exception as e:
+                logging.error(f"Failed to extract {filepath}: {e}")
 
-    def _url_to_filename(self, url: str) -> str:
-        """Converts a URL to a safe, descriptive filename."""
-        # Extracts the document name like 'rfc4271' from the URL
-        match = re.search(r'/doc/html/([^/?]+)', url)
-        if match:
-            doc_name = match.group(1)
-            return f"{doc_name}.md"
-        # Fallback for unexpected URL formats
-        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', url)
-        return f"{safe_name[-50:]}.md"
+class IETFRsyncDownloader:
+    """
+    Downloads RFCs using the official IETF rsync mirrors.
+    """
+    
+    RSYNC_MODULE = "rsync.rfc-editor.org::rfcs"
 
-    async def crawl_and_save(self, urls: list[str]):
-        """
-        Asynchronously crawls URLs and saves their content as markdown files.
-        """
-        if not urls:
-            logging.warning("No URLs provided to crawl. Aborting.")
-            return
-            
-        logging.info(f"Starting crawl for {len(urls)} URLs...")
-        
-        # This config object holds all crawling options.
-        # We can use the defaults for a simple scrape.
-        run_config = CrawlerRunConfig()
-        
-        # AsyncWebCrawler should be used with an 'async with' block
-        async with AsyncWebCrawler() as crawler:
-            # arun_many crawls all URLs concurrently and returns a list of results
-            results = await crawler.arun_many(urls=urls, config=run_config)
-            
-            logging.info("Crawling complete. Saving markdown files...")
-            
-            for result in tqdm(results, desc="Saving files"):
-                if result.success and result.markdown:
-                    filename = self._url_to_filename(result.url)
-                    filepath = os.path.join(self.output_dir, filename)
-                    try:
-                        with open(filepath, "w", encoding="utf-8") as f:
-                            f.write(result.markdown)
-                    except Exception as e:
-                        logging.error(f"Failed to write file {filepath}: {e}")
-                else:
-                    logging.warning(f"Failed to crawl {result.url}: {result.error_message}")
-        
-        logging.info(f"File saving complete. Markdown files are in {self.output_dir}")
+    def __init__(self, base_dir="data"):
+        self.base_dir = base_dir
+        self.raw_dir = os.path.join(base_dir, "raw_rfcs")
+        self.output_dir = os.path.join(base_dir, "rfc_markdown") 
 
-async def run_ingestion():
+        for d in [self.raw_dir, self.output_dir]:
+            os.makedirs(d, exist_ok=True)
+
+    def sync_rfcs(self):
+        logging.info(f"Starting rsync from {self.RSYNC_MODULE} to {self.raw_dir}")
+        cmd = [
+            "rsync",
+            "-avz",
+            "--delete",
+            "--include=*/",
+            "--include=*.txt",
+            "--include=*.xml",
+            "--exclude=*",
+            self.RSYNC_MODULE,
+            self.raw_dir
+        ]
+        
+        logging.info("Running command: " + " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+            logging.info("rsync synchronization completed successfully.")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"rsync failed with exit code {e.returncode}.")
+            logging.error("Note: rsync uses port 873. If you are behind a corporate firewall, this port might be blocked.")
+            raise
+
+def consolidate_documents(base_dir="data"):
+    """Shared consolidation method for both downloaders."""
+    raw_dir = os.path.join(base_dir, "raw_rfcs")
+    output_dir = os.path.join(base_dir, "rfc_markdown")
+    logging.info("Consolidating documents (Preferring XML, fallback to TXT)...")
+    
+    xml_files = glob.glob(os.path.join(raw_dir, "**", "*.xml"), recursive=True)
+    txt_files = glob.glob(os.path.join(raw_dir, "**", "*.txt"), recursive=True)
+
+    rfc_map = {}
+    
+    for file in txt_files:
+        basename = os.path.basename(file).lower()
+        if basename.startswith("rfc") and basename.endswith(".txt"):
+            rfc_num = basename.replace(".txt", "")
+            rfc_map[rfc_num] = {"txt": file, "xml": None}
+            
+    for file in xml_files:
+        basename = os.path.basename(file).lower()
+        if basename.startswith("rfc") and basename.endswith(".xml"):
+            rfc_num = basename.replace(".xml", "")
+            if rfc_num not in rfc_map:
+                rfc_map[rfc_num] = {"txt": None, "xml": file}
+            else:
+                rfc_map[rfc_num]["xml"] = file
+
+    logging.info(f"Found {len(rfc_map)} unique RFCs.")
+    
+    processed = 0
+    for rfc_num, paths in tqdm(rfc_map.items(), desc="Consolidating to output dir"):
+        out_path = os.path.join(output_dir, f"{rfc_num}.md")
+        
+        if os.path.exists(out_path):
+            continue
+        
+        source_file = paths["xml"] if paths["xml"] else paths["txt"]
+        if not source_file:
+            continue
+            
+        shutil.copy2(source_file, out_path)
+        processed += 1
+        
+    logging.info(f"Consolidated {processed} new documents into {output_dir}.")
+
+async def run_ingestion(use_rsync=False):
     """Main async function to run the full data ingestion process."""
-    protocols = ["IDR", "BGP", "OSPF", "ISIS"]
-    crawler = IETFCrawler(output_dir="data/rfc_markdown")
-    
-    rfc_urls = crawler.fetch_rfc_urls(keywords=protocols, limit_per_keyword=25)
-    
-    poc_urls = rfc_urls[:10]
-    logging.info(f"Processing a sample of {len(poc_urls)} URLs for this POC run.")
-
-    # The crawl_and_save method is now a coroutine and must be awaited
-    await crawler.crawl_and_save(urls=poc_urls)
-
+    if use_rsync:
+        logging.info("Starting rsync ingestion of IETF RFCs...")
+        downloader = IETFRsyncDownloader(base_dir="data")
+        downloader.sync_rfcs()
+    else:
+        logging.info("Starting bulk HTTP tarball downloading of IETF RFCs...")
+        downloader = IETFBulkDownloader(base_dir="data")
+        downloader.download_tarballs()
+        downloader.extract_tarballs()
+        
+    consolidate_documents(base_dir="data")
+    logging.info("Data ingestion complete.")
 
 if __name__ == '__main__':
-    # Use asyncio.run() to execute the top-level async function
-    asyncio.run(run_ingestion())
+    # Default to HTTP tarballs if run directly. The CLI will control this.
+    asyncio.run(run_ingestion(use_rsync=False))
