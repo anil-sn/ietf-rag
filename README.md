@@ -55,6 +55,7 @@ This system transcends traditional "chat-with-your-PDF" systems. It is engineere
 
 
 ## Usage:
+```
 uv run python src/main.py ask -q "How OSPF & BGP work togather in L3VPN Solution"
 Compiling FSM for: How OSPF & BGP work togather in L3VPN Solution
 Phase 1: Multi-Query Hybrid Search...
@@ -139,7 +140,7 @@ Verified Context Sources
  [3] RFC1364 - Section 3: BGP Identifier and OSPF router ID, Section 4: Setting OSPF tags, BGP ORIGIN and AS_PATH attributes
  [4] RFC5252 - Section 1: Introduction
  [5] RFC6565 - Section 4.4: BGP Extended Communities Attributes
-
+```
 ---
 ## 🛠️ Installation & Setup
 
