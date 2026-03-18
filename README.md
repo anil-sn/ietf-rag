@@ -6,23 +6,52 @@ This system is optimized for **Protocol Developers and Network Architects** who 
 
 ## 🚀 SOTA Architecture (2026 Edition)
 
-This system abandons the traditional "chatbot" RAG approach in favor of a **Formal Compilation Pipeline**:
+This system transcends traditional "chat-with-your-PDF" systems. It is engineered as a deterministic pipeline designed for maximum factual fidelity. Here are the core techniques implemented:
 
-### 1. Structured Semantic Ingestion
-- **Semantic XML Parsing:** The ingest pipeline (`rfc_xml_parser.py`) processes raw RFCs, preserving strict hierarchical trees and heuristically classifying sections (e.g., `STATE_MACHINE`, `TIMER_LOGIC`, `ERROR_HANDLING`).
-- **Parent-Child Architecture:** Documents are indexed using small, high-density **Child Chunks (800 chars)** for precise vector matching, while retrieving massive **Parent Chunks (3,000 chars)** to provide full structural context.
-- **Hybrid Ensemble Search:** Combines **Vector Similarity** (Semantic understanding) with **BM25 Keyword Search** (Lexical precision for acronyms like BGP, OSPF).
+### 1. Structured Semantic Ingestion & Metadata Tagging
+*   **XML Semantic Parsing:** Instead of blindly chunking plain text, the system downloads raw XML RFCs and traverses the Document Object Model (DOM). It preserves the exact structural hierarchy (`root_section`, `section_number`).
+*   **Heuristic Typing:** It automatically classifies sections based on titles (e.g., tagging a section as `STATE_MACHINE`, `TIMER_LOGIC`, or `SECURITY_CONSIDERATIONS`). This allows for highly targeted retrieval contexts later.
 
-### 2. Formal Compilation Pipeline
-- **Strict Fact Extraction:** Instead of generating text, the LLM is forced to act as an extraction engine, generating structured JSON representations of states, events, conditions, and actions using *exact, verbatim text spans*.
-- **Mathematical Coverage Proofs:** A deterministic Python engine (`CoverageProofEngine`) mathematically verifies that *every single normative sentence* (containing MUST, SHOULD, MAY, MUST NOT) in the retrieved context has been successfully mapped to an atomic protocol fact.
-- **FSM Intermediate Representation (IR):** Extracted facts are parsed into a strongly-typed Intermediate Representation (`protocol_ir.py`), validating topological integrity (e.g., ensuring no dangling states or unhandled events).
-- **Self-Correcting Feedback Loop:** If the coverage proofs or structural proofs fail, the LangGraph agent intercepts the exact Python stack trace/errors, formulates a critique, and forces the LLM to re-extract the facts until mathematical completeness is achieved.
+### 2. Parent-Child Chunking Architecture
+*   **The Context vs. Precision Dilemma:** Traditional RAG uses one chunk size. If chunks are too large, vector search loses precision. If chunks are too small, the LLM loses the surrounding context (e.g., it sees "Timer expires" but not "Which timer in which state?").
+*   **Child Chunks (800 chars):** Used *exclusively* for vector indexing and similarity search. Because they are small, they map tightly to specific concepts, ensuring high retrieval accuracy.
+*   **Parent Chunks (3000 chars):** When a Child Chunk is matched during a search, the system *does not* return the child to the LLM. Instead, it traces back and retrieves the massive Parent Chunk. This ensures the LLM sees the complete logical section, eliminating "lost-in-the-middle" context issues.
 
-### 3. Local-First Technical Stack
-- **Inference:** OpenAI-compatible local server hosting models like **Qwen3.5-27B** set to `Temperature=0.0` for maximum determinism.
-- **Embeddings & Reranking:** Leverages `BAAI/bge-m3` and `bge-reranker-v2-m3`. Includes full support for **Apple Silicon (MPS)**, or offloading to external OpenAI-compatible endpoints (vLLM/Ollama) for extreme speed.
-- **Corporate Ready:** Custom SSL-bypass utilities for environments behind MITM proxies (Zscaler, etc.).
+### 3. SOTA Embeddings (`BAAI/bge-m3`)
+*   **Multi-Lingual, Multi-Function:** We utilize the BGE-M3 model, one of the top open-source embedding models available. 
+*   **8k Context Window:** It natively supports up to 8,192 tokens. This is crucial for networking standards where technical vocabulary stretches over long paragraphs.
+*   **Dense Vectors:** Text is converted into high-dimensional mathematical representations, allowing the system to understand semantic similarity.
+
+### 4. Multi-Query Expansion
+*   **Lexical Gap Bridging:** Users rarely ask questions using the exact terminology found in an RFC.
+*   **LLM Brainstorming:** Before searching the database, the local Qwen LLM intercepts the user's question and generates 3 distinct, highly technical variations. 
+*   **Example:** "How OSPF & BGP work together" is expanded into "Explain OSPF BGP interaction in MPLS Layer 3 VPN architecture." All variations are searched simultaneously.
+
+### 5. Hybrid Ensemble Retrieval
+*   **Vector Search (Semantic):** Uses ChromaDB and BGE-M3 to find chunks based on *meaning*. Great for conceptual questions.
+*   **BM25 Keyword Search (Lexical):** Uses a traditional, TF-IDF based keyword search. Crucial for finding exact acronyms (BGP, OSPF, LSA) which vector models sometimes blur.
+*   **Ensemble Weighting:** The system retrieves results from both engines and blends them using a weighted score (60% Vector / 40% Keyword).
+
+### 6. Cross-Encoder Re-ranking (`BAAI/bge-reranker-v2-m3`)
+*   **The Filtering Phase:** Initial retrieval often returns "noisy" results (e.g., retrieving an RFC that just happens to mention "OSPF" in the glossary).
+*   **Deep Scoring:** The system takes the top 20 messy results from the Hybrid Search and feeds them into a specialized Cross-Encoder neural network. The Cross-Encoder reads the original question *and* the document chunk simultaneously, assigning an absolute relevance score. Only the top 7 ultra-relevant chunks survive.
+
+### 7. Formal LLM Fact Extraction (Zero Temperature)
+*   **Strict JSON Contract:** The LLM (`Qwen3.5-27B.Q4_K_M`) is configured with `Temperature=0.0` (zero creativity). It is instructed *not* to converse.
+*   **Verbatim Spans:** It must extract protocol facts (States, Events, Timers) into a strict JSON schema. Crucially, the text must be an *exact string match* copied from the RFC. No paraphrasing is allowed.
+
+### 8. Deterministic Coverage Proofs (Python Engine)
+*   **Anti-Hallucination Mechanism:** The `CoverageProofEngine` is a hardcoded Python script. It parses the retrieved RFC text and identifies every "Normative Sentence" (any sentence containing `MUST`, `SHOULD`, `MAY`, or `MUST NOT`).
+*   **Mathematical Verification:** The Python engine checks the LLM's JSON output to prove that *every single normative sentence* was mapped to a fact. If the LLM misses a constraint, the proof fails.
+
+### 9. Agentic Retry Loops (LangGraph)
+*   **Self-Correction:** If the Python Coverage Proof fails, the system does not crash. LangGraph orchestrates a feedback loop.
+*   **Critique Injection:** The exact Python stack trace (e.g., *"Normative sentence dropped: 'The Hold Time MUST be either zero...'"*) is fed *back* to the LLM. The LLM is forced to retry the extraction and fix its mistakes (up to 3 attempts).
+
+### 10. Abstract Syntax Tree (AST) & FSM Compilation
+*   **Structural Proofs:** Once extraction passes sentence coverage, the facts are compiled into a Python Object Graph (`ProtocolCompiler`). 
+*   **Logical Validation:** The compiler checks for topological paradoxes (e.g., a transition pointing to a non-existent state, or two transitions triggering on the exact same event/condition). 
+*   **Graceful Degradation:** If the question is purely architectural (and lacks FSM facts), the compiler gracefully falls back to displaying a high-fidelity technical explanation rather than throwing an error.
 
 ---
 

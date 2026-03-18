@@ -34,6 +34,7 @@ class ExtractionOutput(BaseModel):
     """The exact JSON contract the LLM must fulfill."""
     error: Optional[str] = Field(None, description="Set this if rules cannot be satisfied (e.g., UNMAPPED_NORMATIVE_SENTENCE)")
     error_details: Optional[str] = Field(None, description="The exact sentence causing the failure.")
+    general_protocol_explanation: Optional[str] = Field(None, description="If the question is architectural or general and NO normative FSM facts exist, provide a detailed technical explanation here instead of failing.")
     facts: List[ExtractedFact] = Field(default_factory=list)
     sentence_links: List[SentenceLink] = Field(default_factory=list)
 
@@ -86,6 +87,10 @@ class CoverageProofEngine:
         if output.error:
             raise CoverageError(f"LLM explicitly reported failure: {output.error} - {output.error_details}")
 
+        # If LLM chose to provide a general architectural explanation instead of an FSM
+        if output.general_protocol_explanation and not output.facts:
+            return # Bypass strict FSM coverage proofs for general answers
+
         # Validate Fact Grounding
         for fact in output.facts:
             if not fact.text_span or fact.text_span not in context_text:
@@ -107,6 +112,7 @@ class CoverageProofEngine:
 class ProtocolCompiler:
     """Compiles extracted facts into a verified FSM Graph."""
     def __init__(self, extraction: ExtractionOutput):
+        self.extraction = extraction
         self.facts = extraction.facts
         self.registry = EntityRegistry()
 
@@ -120,6 +126,10 @@ class ProtocolCompiler:
         self.errors = [] # Store errors instead of raising exceptions directly
 
     def compile(self):
+        # If it's a general architectural answer and no facts were needed
+        if getattr(self.extraction, "general_protocol_explanation", None) and not self.facts:
+            return self.render_markdown()
+
         self.normalize_entities()
         self.compile_transitions()
         self.compile_constraints()
@@ -214,6 +224,9 @@ class ProtocolCompiler:
                 seen[key] = t["to"]
 
     def render_markdown(self) -> str:
+        if getattr(self.extraction, "general_protocol_explanation", None) and not self.transitions:
+            return f"## Architectural / Procedural Explanation\n\n{self.extraction.general_protocol_explanation}"
+
         if not self.transitions:
             return "No state machine transitions extracted from context."
             

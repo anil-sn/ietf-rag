@@ -22,7 +22,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
-from langchain.retrievers import ParentDocumentRetriever
+from langchain_classic.retrievers.parent_document_retriever import ParentDocumentRetriever
 from langchain_core.stores import InMemoryStore
 
 # Configure logging
@@ -118,7 +118,7 @@ class NetworkingKB:
                 doc = Document(
                     page_content=context_header + content,
                     metadata={
-                        "source_file": f"rfc{rfc_number}",
+                        "source_file": rfc_number,
                         "section_number": sec_num,
                         "section_title": sec_title,
                         "section_type": sec_type,

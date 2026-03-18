@@ -1,6 +1,14 @@
 import os
 import ssl
 import sys
+import warnings
+
+# Suppress all known noisy 3rd party warnings BEFORE any other imports
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", message=".*chardet.*")
+warnings.filterwarnings("ignore", message=".*charset_normalizer.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+warnings.filterwarnings("ignore", category=UserWarning, module="langchain_core")
 
 # Aggressively disable SSL verification for corporate proxy environments
 try:
@@ -38,6 +46,7 @@ console = Console()
 logging.basicConfig(level=logging.ERROR, format='%(levelname)s - %(message)s')
 # We silence the standard info logging when using the interactive CLI to keep it clean
 logger = logging.getLogger()
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
 def main():
     """
@@ -102,6 +111,9 @@ def main():
         console.print("[bold green]Graph extraction complete.[/bold green]")
         
     elif args.action == "ask":
+        # Restore INFO logging so phase progress is visible above the spinner
+        logger.setLevel(logging.INFO)
+        
         from qa_system.rag_pipeline import QASystem
         with console.status("[bold cyan]Initializing Formal Protocol Compiler (Loading Models)...[/bold cyan]", spinner="dots"):
             qa_system = QASystem()
@@ -137,13 +149,26 @@ def process_question(qa_system, question: str):
     
     sources = result.get('sources', [])
     if sources:
-        console.print("\n[bold cyan]VERIFIED SOURCES[/bold cyan]")
-        for i, source in enumerate(sources, 1):
-            source_file = source.get('source', 'Unknown')
-            # Clean up content for display
-            content_snippet = source.get('content', '').replace('\n', ' ')[:250]
-            console.print(f"[cyan][{i}][/cyan] [bold]{source_file}[/bold]")
-            console.print(f"    [dim]{content_snippet}...[/dim]")
+        # Group sources by RFC
+        grouped_sources = {}
+        for source in sources:
+            src_name = source.get('source', 'Unknown').upper()
+            sec_num = source.get('section_number', 'N/A')
+            sec_title = source.get('section_title', 'Unknown Section')
+            
+            if src_name not in grouped_sources:
+                grouped_sources[src_name] = []
+                
+            grouped_sources[src_name].append(f"Section {sec_num}: {sec_title}")
+
+        # Build clean output string
+        source_text = ""
+        for i, (rfc, sections) in enumerate(grouped_sources.items(), 1):
+            unique_sections = list(dict.fromkeys(sections)) # Deduplicate sections
+            sections_str = ", ".join(unique_sections)
+            source_text += f"[bold cyan][{i}][/bold cyan] [bold]{rfc}[/bold] - [dim]{sections_str}[/dim]\n"
+            
+        console.print(Panel(source_text.strip(), title="Verified Context Sources", border_style="cyan"))
     
     console.print()
 

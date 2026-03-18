@@ -4,6 +4,15 @@ import logging
 import warnings
 import torch
 
+# Suppress annoying 3rd party warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+warnings.filterwarnings("ignore", category=UserWarning, module="langchain_core")
+try:
+    from requests.exceptions import RequestsDependencyWarning
+    warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
+except ImportError:
+    pass
+
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ['REQUESTS_CA_BUNDLE'] = ''
 os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
@@ -18,9 +27,9 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain.retrievers.multi_query import MultiQueryRetriever
-from langchain.retrievers.parent_document_retriever import ParentDocumentRetriever
-from langchain.retrievers.ensemble import EnsembleRetriever
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+from langchain_classic.retrievers.parent_document_retriever import ParentDocumentRetriever
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.stores import InMemoryStore
 from langchain_core.documents import Document
@@ -29,8 +38,10 @@ from pydantic import ValidationError
 
 from qa_system.protocol_compiler import ExtractionOutput, CoverageProofEngine, ProtocolCompiler, CoverageError
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Silence verbose logging for 3rd party libs but keep our pipeline logs
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
 class LocalCrossEncoderReranker:
     def __init__(self, model_name="models/bge-reranker-v2-m3"):
@@ -41,7 +52,8 @@ class LocalCrossEncoderReranker:
     def rerank(self, query: str, documents: list[Document], top_k: int = 5) -> list[Document]:
         if not documents: return []
         pairs = [[query, doc.page_content] for doc in documents]
-        scores = self.encoder.predict(pairs)
+        # Set show_progress_bar=False to keep CLI clean
+        scores = self.encoder.predict(pairs, show_progress_bar=False)
         scored_docs = list(zip(documents, scores))
         scored_docs.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, score in scored_docs[:top_k]]
@@ -52,51 +64,63 @@ class GraphState(TypedDict):
     extraction_output: ExtractionOutput
     generation: str
     verification_errors: List[str]
-    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+    verification_attempts: int
+    sources: List[dict]
 
-    ...
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-    class QASystem:
-        VECTOR_DB_PATH = "data/chroma_db"
-        STORE_PATH = "data/doc_store"
-        COLLECTION_NAME = "networking_standards"
-        EMBEDDING_MODEL_NAME = "models/bge-m3"
+class QASystem:
+    VECTOR_DB_PATH = "data/chroma_db"
+    STORE_PATH = "data/doc_store"
+    COLLECTION_NAME = "networking_standards"
+    EMBEDDING_MODEL_NAME = "models/bge-m3"
 
-        def __init__(self, model_name: str = "Qwen3.5-27B.Q4_K_M.gguf", base_url: str = "http://10.83.6.175:8081/v1"):
-            logging.info(f"Initializing 10/10 Formal Protocol Compiler with LLM {model_name}...")
+    def __init__(self, model_name: str = "Qwen3.5-27B.Q4_K_M.gguf", base_url: str = "http://10.83.6.175:8081/v1"):
+        logging.info(f"Initializing 10/10 Formal Protocol Compiler with LLM {model_name}...")
 
-            self.use_openai_embeddings = os.environ.get("USE_OPENAI_EMBEDDINGS", "false").lower() == "true"
+        # Check LLM Server Connectivity
+        import requests
+        try:
+            requests.get(f"{base_url}/models", timeout=5)
+        except Exception as e:
+            logging.error(f"CRITICAL: Cannot reach LLM Server at {base_url}. Is it running? Error: {e}")
 
-            if self.use_openai_embeddings:
-                emb_base_url = os.environ.get("OPENAI_API_BASE", "http://10.83.6.175:8081/v1")
-                emb_api_key = os.environ.get("OPENAI_API_KEY", "sk-not-needed")
-                emb_model = os.environ.get("EMBEDDING_MODEL", "bge-m3") 
+        self.use_openai_embeddings = os.environ.get("USE_OPENAI_EMBEDDINGS", "false").lower() == "true"
 
-                logging.info(f"Loading OpenAI-compatible embedding model ({emb_model}) from {emb_base_url}...")
-                self.embeddings = OpenAIEmbeddings(
-                    model=emb_model,
-                    openai_api_base=emb_base_url,
-                    openai_api_key=emb_api_key,
-                    check_embedding_ctx_length=False
-                )
-            else:
-                logging.info(f"Loading local embedding model from {self.EMBEDDING_MODEL_NAME} on {DEVICE.upper()}...")
-                self.embeddings = HuggingFaceEmbeddings(
-                    model_name=self.EMBEDDING_MODEL_NAME,
-                    model_kwargs={'device': DEVICE, 'local_files_only': True},
-                    encode_kwargs={'normalize_embeddings': True}
-                )
+        if self.use_openai_embeddings:
+            emb_base_url = os.environ.get("OPENAI_API_BASE", "http://10.83.6.175:8081/v1")
+            emb_api_key = os.environ.get("OPENAI_API_KEY", "sk-not-needed")
+            emb_model = os.environ.get("EMBEDDING_MODEL", "bge-m3") 
 
-            self.vector_store = Chroma(
-                collection_name=self.COLLECTION_NAME,
-                embedding_function=self.embeddings,
-                persist_directory=self.VECTOR_DB_PATH
+            logging.info(f"Loading OpenAI-compatible embedding model ({emb_model}) from {emb_base_url}...")
+            self.embeddings = OpenAIEmbeddings(
+                model=emb_model,
+                openai_api_base=emb_base_url,
+                openai_api_key=emb_api_key,
+                check_embedding_ctx_length=False
             )
+        else:
+            logging.info(f"Loading local embedding model from {self.EMBEDDING_MODEL_NAME} on {DEVICE.upper()}...")
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=self.EMBEDDING_MODEL_NAME,
+                model_kwargs={'device': DEVICE, 'local_files_only': True},
+                encode_kwargs={'normalize_embeddings': True},
+                show_progress=False # Keep CLI clean
+            )
+
+        self.vector_store = Chroma(
+            collection_name=self.COLLECTION_NAME,
+            embedding_function=self.embeddings,
+            persist_directory=self.VECTOR_DB_PATH
+        )
+        
+        self.llm = ChatOpenAI(
             base_url=base_url,
             api_key="sk-not-needed", 
             model=model_name,
             temperature=0.0, # Zero temp for strict parsing
-            max_tokens=4096
+            max_tokens=4096,
+            timeout=120 # 2 minute timeout for complex extractions
         )
         
         doc_store_path = os.path.join(self.STORE_PATH, "store.pkl")
@@ -122,7 +146,14 @@ class GraphState(TypedDict):
         else:
             ensemble_retriever = parent_retriever
 
-        self.retriever = MultiQueryRetriever.from_llm(retriever=ensemble_retriever, llm=self.llm)
+        multi_query_prompt = PromptTemplate(
+            input_variables=["question"],
+            template="""You are an AI assistant. Generate 3 different versions of the given user question to retrieve relevant technical documents from a vector database.
+CRITICAL: Output ONLY the 3 alternative questions, separated by newlines. Do NOT output any conversational text, introductory remarks, markdown formatting, or reasoning. Just 3 lines of text.
+Original question: {question}"""
+        )
+
+        self.retriever = MultiQueryRetriever.from_llm(retriever=ensemble_retriever, llm=self.llm, prompt=multi_query_prompt)
         
         try:
             self.reranker = LocalCrossEncoderReranker()
@@ -221,7 +252,10 @@ MANDATORY RULES
 3. ATOMICITY: Each fact MUST come from ONE sentence only. Do NOT merge multiple sentences.
 4. NO GUESSING: If information is unclear → DO NOT create a fact.
 5. RAW ENTITIES: Extract EXACT tokens from text (e.g., "Hold Timer", "Idle state").
-6. FAILURE MODE: If ANY rule cannot be satisfied, set the "error" field in the JSON output.
+6. FAILURE MODE & ARCHITECTURAL QUESTIONS: 
+   - If the user's question is about general architecture or procedure (e.g., "How does X work with Y?") rather than a specific Finite State Machine, AND the context contains no FSM normative rules...
+   - DO NOT fail. Instead, leave the `facts` and `sentence_links` empty, and provide a highly detailed, technical answer in the `general_protocol_explanation` field.
+
 {critique}
 
 --------------------------------------------------
@@ -308,10 +342,29 @@ QUESTION: {question}""",
             "sources": []
         }
         final_state = self.app.invoke(initial_state)
-        sources = [{"source": doc.metadata.get("source_file", "Unknown"), "content": doc.page_content} for doc in final_state["documents"]]
+        
+        # Process and clean sources
+        raw_sources = []
+        for doc in final_state["documents"]:
+            src = doc.metadata.get("source_file", "Unknown")
+            # Deduplicate prefix: 'rfcrfc4271' -> 'rfc4271'
+            if src.startswith("rfcrfc"):
+                src = src[3:]
+            
+            # Prioritize proper RFCs and exclude raw reference dumps like "[DesignReport]" if possible
+            if not src.lower().startswith("rfc") and len(src) > 10:
+                continue
+
+            raw_sources.append({
+                "source": src,
+                "section_number": doc.metadata.get("section_number", "N/A"),
+                "section_title": doc.metadata.get("section_title", "Unknown"),
+                "content": doc.page_content
+            })
+            
         return {
             "answer": final_state["generation"],
-            "sources": sources
+            "sources": raw_sources
         }
 
 def run_qa():
